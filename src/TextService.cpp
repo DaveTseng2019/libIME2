@@ -202,6 +202,9 @@ void TextService::startComposition(ITfContext* context) {
 void TextService::endComposition(ITfContext* context) {
     assert(context);
     HRESULT sessionResult;
+    // Keep TextService alive in case TSF defers the edit session asynchronously
+    // (e.g. when endComposition is called from ITfTextEditSink::OnEndEdit).
+    // The ITfContext is kept alive by EditSession's ComPtr<ITfContext>.
     ComPtr<TextService> self(this);
     auto editSession = ComPtr<EditSession>::make(
         context,
@@ -234,6 +237,9 @@ void TextService::endComposition(ITfContext* context) {
             }
         }
     );
+    // Use TF_ES_ASYNCDONTCARE so normal callers still execute synchronously,
+    // while calls from OnEndEdit (which holds a read-only lock where TF_ES_SYNC
+    // fails with TF_E_SYNCHRONOUS) are queued asynchronously by TSF.
     context->RequestEditSession(clientId_, editSession, TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &sessionResult);
 }
 
@@ -519,7 +525,9 @@ void TextService::installEventListeners() {
         activateLanguageProfileNotifySink_ = SinkAdvice{ source, IID_ITfActiveLanguageProfileNotifySink, static_cast<ITfActiveLanguageProfileNotifySink*>(this) };
     }
 
-    // ITfTextEditSink must be advised on the active ITfContext, not ITfThreadMgr.
+    // ITfTextEditSink is a context-level sink and must be advised on the active
+    // ITfContext, not ITfThreadMgr. Advise it on the initially focused document
+    // here; OnSetFocus() updates it whenever focus moves to another document.
     ComPtr<ITfDocumentMgr> docMgr;
     if (threadMgr_->GetFocus(&docMgr) == S_OK) {
         updateTextEditSink(docMgr);
@@ -560,6 +568,8 @@ void TextService::uninstallEventListeners() {
     keyboardOPenCloseSink_.unadvise();
 }
 
+// Unadvises the previous context and advises ITfTextEditSink on the top
+// ITfContext of docMgr (if any).
 void TextService::updateTextEditSink(ITfDocumentMgr* docMgr) {
     textEditSink_.unadvise();
     if (!docMgr) {
@@ -670,6 +680,7 @@ STDMETHODIMP TextService::OnUninitDocumentMgr(ITfDocumentMgr *pDocMgr) {
 }
 
 STDMETHODIMP TextService::OnSetFocus(ITfDocumentMgr *pDocMgrFocus, ITfDocumentMgr *pDocMgrPrevFocus) {
+    // Re-advise ITfTextEditSink on the newly focused document's top context.
     updateTextEditSink(pDocMgrFocus);
     return S_OK;
 }
